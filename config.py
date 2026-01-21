@@ -25,10 +25,6 @@ class Config:
     backbone_name: str = "dinov2"
     num_classes: int = 4
     embed_dim: int = 512  # 增强版分类头中间层维度
-    
-    # 特征投影层配置（用于打破特征坍缩）
-    use_projector: bool = True  # 是否使用特征投影层
-    projector_dim: int = 512    # 投影层输出维度
 
     # 3DINO
     dinov2_ckpt: Optional[str] = (

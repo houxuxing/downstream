@@ -137,7 +137,7 @@ def create_dinov2_backbone(cfg: Config, device: torch.device) -> nn.Module:
 def _apply_kaiming_init(module: nn.Module) -> None:
     """Apply Kaiming init to a module.
     
-    WARNING: 仅用于初始化新增模块（如 classifier, projector）。
+    WARNING: 仅用于初始化新增模块（如 classifier）。
     严禁对 backbone、patch_embed、blocks、norm、pos_embed、cls_token 调用此函数，
     否则会覆盖预训练权重，导致特征坍缩。
     """
@@ -164,8 +164,6 @@ def create_model(cfg: Config, device: torch.device) -> AnatCLClassifier:
         backbone, 
         num_classes=cfg.num_classes, 
         embed_dim=cfg.embed_dim,
-        use_projector=cfg.use_projector,
-        projector_dim=cfg.projector_dim,
     ).to(device)
 
     # Kaiming 初始化
@@ -268,27 +266,17 @@ def create_dataloaders(
 def create_optimizer(model, cfg: Config) -> torch.optim.Optimizer:
     """创建优化器
     
-    参数组分为三部分：
+    参数组分为两部分：
     1. 分类头参数：使用较高的学习率 (head_lr)
-    2. 投影层参数：使用中等学习率 (head_lr * 0.5)
-    3. backbone 参数：使用较低的学习率 (backbone_lr)
+    2. backbone 参数：使用较低的学习率 (backbone_lr)
     """
     # 分类头参数
     head_params = [p for p in model.classifier.parameters() if p.requires_grad]
-    
-    # 投影层参数（如果存在）
-    projector_params = []
-    if hasattr(model, 'feature_projector') and model.feature_projector is not None:
-        projector_params = [p for p in model.feature_projector.parameters() if p.requires_grad]
     
     # backbone 参数
     backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
 
     param_groups = [{"params": head_params, "lr": cfg.head_lr, "name": "head"}]
-    
-    if projector_params:
-        # 投影层使用稍低的学习率
-        param_groups.append({"params": projector_params, "lr": cfg.head_lr * 0.5, "name": "projector"})
     
     if backbone_params:
         param_groups.append({"params": backbone_params, "lr": cfg.backbone_lr, "name": "backbone"})
