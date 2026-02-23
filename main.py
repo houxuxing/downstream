@@ -11,7 +11,6 @@ AnatCL 四分类下游任务主入口
 
 import os
 import random
-from typing import cast
 
 import numpy as np
 
@@ -24,12 +23,10 @@ from monai.data.dataloader import DataLoader
 
 from loss.AnatCL_loss import AnatCLGlobalLoss
 
-from model.classifier import AnatCLClassifier
-from model.freezing import setup_parameter_freezing
+from model.classifier import AnatCLClassifier, DualBranchClassifier
+from model.freezing import setup_parameter_freezing, setup_dual_branch_freezing
 
-# DINOv2 相关导入
-from dinov2_models.vision_transformer import vit_large_3d
-from dinov2_utils.utils import load_pretrained_weights
+from model_builder import create_model, create_dual_branch_model
 
 from config import Config
 from dataset import MRIDataset
@@ -38,7 +35,7 @@ from trainer import (
     train_epoch,
     validate_epoch,
     create_lr_scheduler,
-    check_optimizer_config,
+    schedule_lambda_global,
 )
 from utils import (
     save_plots,
@@ -47,6 +44,8 @@ from utils import (
     make_balanced_indices,
     print_dataset_info,
     print_test_results,
+    compute_metrics,
+    build_weighted_sampler,
 )
 
 
@@ -57,121 +56,30 @@ def seed_worker(worker_id: int):
     random.seed(worker_seed)
 
 
-def DINOv2Backbone(dinov2_model: nn.Module) -> nn.Module:
-    """DINOv2 3D Vision Transformer 包装器
+def set_global_seed(cfg: Config, is_main: bool = True) -> None:
+    """设置全局随机种子，确保实验可复现"""
+    seed = int(cfg.seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    将 DINOv2 的 3D ViT 适配为分类任务的 backbone。
-    通过 forward_features 提取 CLS token 作为特征输出。
-    """
-    
-    class _Wrapper(nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.model = model
-            # DINOv2 ViT-Large 的 embed_dim 为 1024
-            self.dim_in = 1024
+    torch.backends.cudnn.deterministic = bool(cfg.cudnn_deterministic)
+    torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            """
-            Args:
-                x: 输入图像张量，形状 (B, C, D, H, W)
+    if cfg.deterministic:
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception as e:
+            if is_main:
+                print(f"[WARNING] 无法使用确定性算法: {type(e).__name__}: {e}")
 
-            Returns:
-                特征向量，形状 (B, dim_in)
-            """
-            B = x.shape[0]
-            
-            # forward_features 返回字典，包含:
-            # - "x_norm_clstoken": (B, embed_dim) - CLS token
-            # - "x_norm_patchtokens": (B, N, embed_dim) - patch tokens
-            features = self.model.forward_features(x)
-            
-            # 使用 CLS token 作为全局特征表示
-            cls_token = features["x_norm_clstoken"]
-            
-            # 【关键断言】确保输出形状正确，防止维度错误
-            assert cls_token.dim() == 2, (
-                f"CLS token 应为 2D [B, C], 实际为 {cls_token.dim()}D, shape={cls_token.shape}"
-            )
-            assert cls_token.shape[0] == B, (
-                f"CLS token batch 维度错误: 期望 {B}, 实际 {cls_token.shape[0]}"
-            )
-            
-            return cls_token
-
-    return _Wrapper(dinov2_model)
-
-
-def create_dinov2_backbone(cfg: Config, device: torch.device) -> nn.Module:
-    """创建 DINOv2 3D Vision Transformer backbone
-
-    使用 vit_base_3d 创建 3D ViT 模型，并加载预训练权重。
-    DINOv2 是一个强大的自监督视觉模型，其 3D 变体适用于医学影像。
-    """
-    # 获取输入尺寸（假设是立方体）
-    img_size = cfg.target_size[0]
-
-    # 创建 3D ViT 模型 (Large 版本，匹配预训练权重 embed_dim=1024)
-    model = vit_large_3d(
-        img_size=img_size,
-        patch_size=16,
-        in_chans=1,  # 医学影像通常为单通道
-        block_chunks=4,
-        init_values=1e-5,
-    )
-
-    # 加载预训练权重（如果指定）
-    if cfg.dinov2_ckpt is not None:
-        print(f"[INFO] 加载 DINOv2 预训练权重: {cfg.dinov2_ckpt}")
-        load_pretrained_weights(model, cfg.dinov2_ckpt, checkpoint_key="teacher")
-
-    # 创建包装器
-    backbone = DINOv2Backbone(model).to(device)
-
-    print(
-        f"\n[INFO] 使用 DINOv2 Backbone (ViT-Large-3D)，输出特征维度: {backbone.dim_in}"
-    )
-    return backbone
-
-
-def _apply_kaiming_init(module: nn.Module) -> None:
-    """Apply Kaiming init to a module.
-    
-    WARNING: 仅用于初始化新增模块（如 classifier）。
-    严禁对 backbone、patch_embed、blocks、norm、pos_embed、cls_token 调用此函数，
-    否则会覆盖预训练权重，导致特征坍缩。
-    """
-
-    def init_kaiming_all(m):
-        if isinstance(m, (nn.Conv3d, nn.Linear)):
-            nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-    module.apply(init_kaiming_all)
-
-
-def create_model(cfg: Config, device: torch.device) -> AnatCLClassifier:
-    """创建并初始化模型（主入口函数）
-
-    目前仅支持 DINOv2 作为 backbone。
-    """
-    # 创建 DINOv2 backbone
-    backbone = create_dinov2_backbone(cfg, device)
-
-    # 创建分类器（线性层在 AnatCLClassifier 中定义）
-    model = AnatCLClassifier(
-        backbone, 
-        num_classes=cfg.num_classes, 
-        embed_dim=cfg.embed_dim,
-    ).to(device)
-
-    # Kaiming 初始化
-    if cfg.init_mode == "kaiming":
-        print("[INFO] 使用 Kaiming 初始化")
-        _apply_kaiming_init(model.classifier)
-
-    return model
+    if is_main:
+        print(
+            f"[SEED] seed={seed} deterministic={cfg.deterministic} "
+            f"cudnn_deterministic={cfg.cudnn_deterministic} cudnn_benchmark={cfg.cudnn_benchmark}"
+        )
 
 
 def create_dataloaders(
@@ -188,7 +96,9 @@ def create_dataloaders(
         measure_root=cfg.measure_root if cfg.use_global_loss else None,
         region_order_json=cfg.region_order_json if cfg.use_global_loss else None,
         enable_memory_efficient=cfg.enable_memory_efficient_mode,
-        two_view=cfg.two_view,
+        min_int=cfg.min_int,
+        resize_scale=cfg.resize_scale,
+        use_nnunet_zscore=cfg.use_nnunet_zscore,
     )
 
     # 患者级拆分
@@ -196,51 +106,113 @@ def create_dataloaders(
         split_dataset_by_patient(full_dataset)
     )
 
-    # 均衡采样
-    balanced_train_idx = make_balanced_indices(train_idx, full_dataset, seed=42)
-    balanced_val_idx = make_balanced_indices(val_idx, full_dataset, seed=2025)
-    balanced_test_idx = make_balanced_indices(test_idx, full_dataset, seed=3407)
+    # ========================
+    # 实际使用的索引（默认训练可均衡；验证/测试默认全量）
+    # ========================
+    if cfg.balance_strategy == "downsample_to_pmci":
+        train_idx_used = make_balanced_indices(
+            train_idx,
+            full_dataset,
+            seed=int(cfg.seed),
+            expected_classes=list(cfg.classes),
+            base_class="pMCI",
+        )
+        val_idx_used = make_balanced_indices(
+            val_idx,
+            full_dataset,
+            seed=2025,
+            expected_classes=list(cfg.classes),
+            base_class="pMCI",
+        )
+        test_idx_used = make_balanced_indices(
+            test_idx,
+            full_dataset,
+            seed=3407,
+            expected_classes=list(cfg.classes),
+            base_class="pMCI",
+        )
+    else:
+        if cfg.balance_strategy == "downsample":
+            train_idx_used = make_balanced_indices(
+                train_idx,
+                full_dataset,
+                seed=int(cfg.seed),
+                expected_classes=list(cfg.classes),
+            )
+        else:
+            train_idx_used = train_idx  # 全量训练集，不丢数据
 
-    # 设置训练索引（启用数据增强）
-    full_dataset.set_train_idx(balanced_train_idx)
+        if cfg.balance_eval_downsample:
+            val_idx_used = make_balanced_indices(
+                val_idx, full_dataset, seed=2025, expected_classes=list(cfg.classes)
+            )
+            test_idx_used = make_balanced_indices(
+                test_idx, full_dataset, seed=3407, expected_classes=list(cfg.classes)
+            )
+        else:
+            val_idx_used = val_idx
+            test_idx_used = test_idx
+
+    # 设置训练索引（仅训练集启用数据增强）
+    full_dataset.set_train_idx(train_idx_used)
 
     # 创建子集
-    train_set = Subset(full_dataset, balanced_train_idx)
-    val_set = Subset(full_dataset, balanced_val_idx)
-    test_set = Subset(full_dataset, balanced_test_idx)
+    train_set = Subset(full_dataset, train_idx_used)
+    val_set = Subset(full_dataset, val_idx_used)
+    test_set = Subset(full_dataset, test_idx_used)
 
     # 创建 MONAI DataLoader
     # MONAI DataLoader 继承自 PyTorch DataLoader，针对医学影像进行了优化
     g = torch.Generator()
-    g.manual_seed(42)  # 固定随机种子
+    g.manual_seed(int(cfg.seed))  # 固定随机种子
 
-    common_kwargs: dict = dict(
+    train_kwargs: dict = dict(
         num_workers=cfg.num_workers,
-        pin_memory=True,
+        pin_memory=cfg.pin_memory,
         worker_init_fn=seed_worker if cfg.num_workers > 0 else None,
         generator=g,
     )
 
     if cfg.num_workers > 0:
-        common_kwargs.update(dict(persistent_workers=True, prefetch_factor=2))
+        train_kwargs.update(dict(persistent_workers=True, prefetch_factor=2))
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        **common_kwargs,
+    val_num_workers = int(getattr(cfg, "num_workers_val", 0))
+    val_kwargs: dict = dict(
+        num_workers=val_num_workers,
+        pin_memory=cfg.pin_memory,
+        worker_init_fn=seed_worker if val_num_workers > 0 else None,
     )
+
+    train_sampler_info = None
+    if cfg.balance_strategy == "weighted_sampler":
+        sampler, train_sampler_info = build_weighted_sampler(
+            train_set, full_dataset, cfg, return_info=True
+        )
+        train_loader = DataLoader(
+            train_set,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            sampler=sampler,
+            **train_kwargs,
+        )
+    else:
+        train_loader = DataLoader(
+            train_set,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            **train_kwargs,
+        )
     val_loader = DataLoader(
         val_set,
         batch_size=cfg.batch_size,
         shuffle=False,
-        **common_kwargs,
+        **val_kwargs,
     )
     test_loader = DataLoader(
         test_set,
         batch_size=cfg.batch_size,
         shuffle=False,
-        **common_kwargs,
+        **val_kwargs,
     )
 
     if is_main:
@@ -252,36 +224,297 @@ def create_dataloaders(
             train_idx,
             val_idx,
             test_idx,
-            balanced_train_idx,
-            balanced_val_idx,
-            balanced_test_idx,
+            train_idx_used,
+            val_idx_used,
+            test_idx_used,
+            cfg=cfg,
+            sampler_info=train_sampler_info,
         )
         print(
-            f"\n[INFO] 使用平衡后数据集：训练影像数: {len(train_set)}，验证影像数: {len(val_set)}，测试影像数: {len(test_set)}"
+            f"\n[INFO] 实际使用数据集：训练影像数: {len(train_set)}，验证影像数: {len(val_set)}，测试影像数: {len(test_set)}"
         )
 
     return train_loader, val_loader, test_loader
 
 
-def create_optimizer(model, cfg: Config) -> torch.optim.Optimizer:
-    """创建优化器
-    
-    参数组分为两部分：
-    1. 分类头参数：使用较高的学习率 (head_lr)
-    2. backbone 参数：使用较低的学习率 (backbone_lr)
+def compute_scaled_lr(
+    base_lr: float, batch_size: int, base_batch_size: int = 1024
+) -> float:
+    """基于 Batch Size 的平方根缩放规则计算实际学习率
+
+    公式: lr = base_lr * sqrt(batch_size / base_batch_size)
+
+    Args:
+        base_lr: 基准学习率（对应 base_batch_size）
+        batch_size: 实际使用的总 batch size（包含梯度累积）
+        base_batch_size: 基准 batch size（默认 1024）
+
+    Returns:
+        缩放后的学习率
     """
-    # 分类头参数
-    head_params = [p for p in model.classifier.parameters() if p.requires_grad]
-    
-    # backbone 参数
-    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    import math
 
-    param_groups = [{"params": head_params, "lr": cfg.head_lr, "name": "head"}]
-    
-    if backbone_params:
-        param_groups.append({"params": backbone_params, "lr": cfg.backbone_lr, "name": "backbone"})
+    scale_factor = math.sqrt(batch_size / base_batch_size)
+    return base_lr * scale_factor
 
-    return torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+
+def create_optimizer(model, cfg: Config) -> torch.optim.Optimizer:
+    """创建优化器，支持单分支和双分支模型"""
+    total_batch_size = cfg.batch_size * cfg.gradient_accumulation_steps
+
+    head_lr = compute_scaled_lr(cfg.base_head_lr, total_batch_size, cfg.base_batch_size)
+    backbone_lr = compute_scaled_lr(
+        cfg.base_backbone_lr, total_batch_size, cfg.base_batch_size
+    )
+
+    print()
+    print(
+        f"[INFO] LR 缩放: Total_BS={total_batch_size}, Head_LR={head_lr:.2e}, Backbone_LR={backbone_lr:.2e}"
+    )
+
+    # 判断是否为双分支模型
+    is_dual_branch = isinstance(model, DualBranchClassifier)
+
+    norm_types = (
+        nn.LayerNorm,
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.SyncBatchNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+        nn.GroupNorm,
+    )
+
+    def collect_norm_param_ids(module: nn.Module):
+        norm_ids = set()
+        for m in module.modules():
+            if isinstance(m, norm_types):
+                for p in m.parameters(recurse=False):
+                    norm_ids.add(id(p))
+        return norm_ids
+
+    def is_no_decay(name: str, param: torch.nn.Parameter, norm_ids) -> bool:
+        if id(param) in norm_ids:
+            return True
+        if name.endswith(".bias"):
+            return True
+        if ("pos_embed" in name) or ("cls_token" in name) or ("mask_token" in name):
+            return True
+        return False
+
+    param_groups = []
+
+    # Head: split decay/no_decay (classifier)
+    # 注意：双分支模型的 aggregator 在融合层中处理，单分支模型的 aggregator 在这里处理
+    head_modules = [("classifier", model.classifier)]
+    if not is_dual_branch and hasattr(model, "aggregator") and model.aggregator is not None:
+        head_modules.append(("aggregator", model.aggregator))
+
+    head_norm_ids = set()
+    for _, m in head_modules:
+        head_norm_ids |= collect_norm_param_ids(m)
+
+    head_decay, head_no_decay = [], []
+    for prefix, m in head_modules:
+        for name, param in m.named_parameters():
+            if not param.requires_grad:
+                continue
+            full_name = f"{prefix}.{name}"
+            if is_no_decay(full_name, param, head_norm_ids):
+                head_no_decay.append(param)
+            else:
+                head_decay.append(param)
+
+    if head_decay:
+        param_groups.append(
+            {
+                "params": head_decay,
+                "lr": head_lr,
+                "weight_decay": cfg.weight_decay_init,
+                "wd_scale": 1.0,
+                "name": "head_decay",
+            }
+        )
+    if head_no_decay:
+        param_groups.append(
+            {
+                "params": head_no_decay,
+                "lr": head_lr,
+                "weight_decay": 0.0,
+                "wd_scale": 0.0,
+                "name": "head_no_decay",
+            }
+        )
+
+    if head_decay or head_no_decay:
+        print(
+            f"  - Head(+Agg): decay={sum(p.numel() for p in head_decay):,}, "
+            f"no_decay={sum(p.numel() for p in head_no_decay):,} params, lr={head_lr:.6e}"
+        )
+
+    # Backbone: split decay/no_decay
+    # 支持双分支模型：使用 backbone1 处理第一个分支
+    backbone_to_process = model.backbone1 if is_dual_branch else model.backbone
+    
+    backbone_norm_ids = collect_norm_param_ids(backbone_to_process)
+
+    backbone_decay, backbone_no_decay = [], []
+    for name, param in backbone_to_process.named_parameters():
+        if not param.requires_grad:
+            continue
+        if is_no_decay(name, param, backbone_norm_ids):
+            backbone_no_decay.append(param)
+        else:
+            backbone_decay.append(param)
+
+    if backbone_decay:
+        param_groups.append(
+            {
+                "params": backbone_decay,
+                "lr": backbone_lr,
+                "weight_decay": cfg.weight_decay_init * cfg.backbone_wd_scale,
+                "wd_scale": cfg.backbone_wd_scale,
+                "name": "backbone_decay",
+            }
+        )
+    if backbone_no_decay:
+        param_groups.append(
+            {
+                "params": backbone_no_decay,
+                "lr": backbone_lr,
+                "weight_decay": 0.0,
+                "wd_scale": 0.0,
+                "name": "backbone_no_decay",
+            }
+        )
+
+    if backbone_decay or backbone_no_decay:
+        print(
+            f"  - Backbone: decay={sum(p.numel() for p in backbone_decay):,}, no_decay={sum(p.numel() for p in backbone_no_decay):,} params, lr={backbone_lr:.6e}"
+        )
+
+    # 双分支模型：处理第二个 backbone
+    if is_dual_branch:
+        backbone2_norm_ids = collect_norm_param_ids(model.backbone2)
+
+        backbone2_decay, backbone2_no_decay = [], []
+        for name, param in model.backbone2.named_parameters():
+            if not param.requires_grad:
+                continue
+            if is_no_decay(name, param, backbone2_norm_ids):
+                backbone2_no_decay.append(param)
+            else:
+                backbone2_decay.append(param)
+
+        if backbone2_decay:
+            param_groups.append(
+                {
+                    "params": backbone2_decay,
+                    "lr": backbone_lr,
+                    "weight_decay": cfg.weight_decay_init * cfg.backbone_wd_scale,
+                    "wd_scale": cfg.backbone_wd_scale,
+                    "name": "backbone2_decay",
+                }
+            )
+        if backbone2_no_decay:
+            param_groups.append(
+                {
+                    "params": backbone2_no_decay,
+                    "lr": backbone_lr,
+                    "weight_decay": 0.0,
+                    "wd_scale": 0.0,
+                    "name": "backbone2_no_decay",
+                }
+            )
+
+        if backbone2_decay or backbone2_no_decay:
+            print(
+                f"  - Backbone2: decay={sum(p.numel() for p in backbone2_decay):,}, no_decay={sum(p.numel() for p in backbone2_no_decay):,} params, lr={backbone_lr:.6e}"
+            )
+
+        # 双分支模型：处理融合层参数 (proj1, proj2, ca1, ca2, aggregator)
+        fusion_modules = []
+        for name in ["proj1", "proj2", "ca1", "ca2", "aggregator"]:
+            if hasattr(model, name):
+                module = getattr(model, name)
+                if module is not None:
+                    fusion_modules.append((name, module))
+
+        if fusion_modules:
+            fusion_norm_ids = set()
+            for _, m in fusion_modules:
+                fusion_norm_ids |= collect_norm_param_ids(m)
+
+            fusion_decay, fusion_no_decay = [], []
+            for prefix, m in fusion_modules:
+                for name, param in m.named_parameters():
+                    if not param.requires_grad:
+                        continue
+                    full_name = f"{prefix}.{name}"
+                    if is_no_decay(full_name, param, fusion_norm_ids):
+                        fusion_no_decay.append(param)
+                    else:
+                        fusion_decay.append(param)
+
+            if fusion_decay:
+                param_groups.append(
+                    {
+                        "params": fusion_decay,
+                        "lr": head_lr,
+                        "weight_decay": cfg.weight_decay_init,
+                        "wd_scale": 1.0,
+                        "name": "fusion_decay",
+                    }
+                )
+            if fusion_no_decay:
+                param_groups.append(
+                    {
+                        "params": fusion_no_decay,
+                        "lr": head_lr,
+                        "weight_decay": 0.0,
+                        "wd_scale": 0.0,
+                        "name": "fusion_no_decay",
+                    }
+                )
+
+            if fusion_decay or fusion_no_decay:
+                print(
+                    f"  - Fusion Layers: decay={sum(p.numel() for p in fusion_decay):,}, "
+                    f"no_decay={sum(p.numel() for p in fusion_no_decay):,} params, lr={head_lr:.6e}"
+                )
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        betas=(cfg.adamw_beta1, cfg.adamw_beta2),
+        weight_decay=cfg.weight_decay_init,
+    )
+
+    # Sanity check: optimizer covers all trainable params
+    opt_param_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
+    missing = [
+        n
+        for n, p in model.named_parameters()
+        if p.requires_grad and id(p) not in opt_param_ids
+    ]
+    if missing:
+        raise RuntimeError(
+            "Optimizer does NOT include all trainable parameters! Missing:\n"
+            + "\n".join(missing[:50])
+            + (f"\n... ({len(missing)} total)" if len(missing) > 50 else "")
+        )
+
+    print()
+    print("[INFO] AdamW 优化器:")
+    print(f"  - Betas: ({cfg.adamw_beta1}, {cfg.adamw_beta2})")
+    print(
+        f"  - Weight Decay (init -> end): {cfg.weight_decay_init} -> {cfg.weight_decay_end}"
+    )
+    print(f"  - Backbone WD Scale: {cfg.backbone_wd_scale}")
+    print(f"  - Grad Clip: {cfg.max_grad_norm}")
+
+    return optimizer
 
 
 @torch.no_grad()
@@ -304,270 +537,300 @@ def diagnose_loaded_collapse(
 
     data, target, sample_id, age, measures = batch_data
 
-    # If a two-view batch slips in, keep the first view only.
-    if data.ndim == 6 and data.size(1) == 2:
-        data = data[:, 0]
-
     data = data.to(device, non_blocking=True)
 
-    backbone_features = model.backbone(data)
-    logits = model(data, return_features=False)
+    # 判断是否为双分支模型
+    is_dual_branch = isinstance(model, DualBranchClassifier)
 
-    print("\n" + "=" * 60)
-    print("[DIAG] Loaded-weight collapse check (single batch)")
-    print("=" * 60)
-    print(f"batch: {data.shape}, dtype={data.dtype}")
-
-    # Cosine similarity across samples in the backbone feature space.
-    if backbone_features.shape[0] > 1:
-        feat_norm = backbone_features / (
-            backbone_features.norm(dim=1, keepdim=True) + 1e-8
-        )
-        cos_sim = feat_norm @ feat_norm.t()
-        mask = ~torch.eye(cos_sim.shape[0], dtype=torch.bool, device=cos_sim.device)
-        off_diag = cos_sim[mask]
-        cos_mean = off_diag.mean().item()
-        cos_min = off_diag.min().item()
-        cos_max = off_diag.max().item()
-        print(
-            f"backbone cosine(sim) off-diag: mean={cos_mean:.6f}, min={cos_min:.6f}, max={cos_max:.6f}"
-        )
-    else:
-        print("backbone cosine(sim) off-diag: N/A (batch_size < 2)")
-
-    # Logits variance (per-sample and across samples).
-    if logits.shape[0] > 0:
-        logits_std_per_sample = logits.std(dim=1).mean().item()
-        if logits.shape[0] > 1:
-            logits_std_across = logits.std(dim=0).tolist()
+    with torch.no_grad():
+        if is_dual_branch:
+            # 双分支模型：分别获取两个分支的特征
+            extracted_features1 = model.backbone1(data)
+            extracted_features2 = model.backbone2(data)
+            print("\n" + "=" * 60)
+            print("[DIAG] Loaded-weight collapse check (dual branch, single batch)")
+            print("=" * 60)
+            print(f"batch: {data.shape}, dtype={data.dtype}")
+            print(f"backbone1 output: {extracted_features1.shape}")
+            print(f"backbone2 output: {extracted_features2.shape}")
         else:
-            logits_std_across = [float("nan")] * logits.shape[1]
-        print(f"logits std per-sample (mean): {logits_std_per_sample:.6f}")
-        print(f"logits std across samples: {logits_std_across}")
+            # 单分支模型
+            assert isinstance(model, AnatCLClassifier), (
+                f"Model should be AnatCLClassifier, got {type(model)}"
+            )
+            extracted_features = model.backbone(data)
+            print("\n" + "=" * 60)
+            print("[DIAG] Loaded-weight collapse check (single batch)")
+            print("=" * 60)
+            print(f"batch: {data.shape}, dtype={data.dtype}")
+            print(f"backbone output: {extracted_features.shape}")
+
+            if hasattr(model, "aggregator") and model.aggregator is not None:
+                aggregated = model.aggregator(extracted_features)
+                print(f"aggregator output: {aggregated.shape}")
+
+                # Check for collapse: all-same across batch dimension
+                std_per_feature = aggregated.std(dim=0)
+                n_dead = (std_per_feature < 1e-6).sum().item()
+                print(
+                    f"aggregator output std per feature: min={std_per_feature.min():.6f}, "
+                    f"max={std_per_feature.max():.6f}, mean={std_per_feature.mean():.6f}"
+                )
+                print(f"Dead features (std < 1e-6): {n_dead} / {aggregated.shape[1]}")
+
+                if n_dead == aggregated.shape[1]:
+                    print("[WARNING] 检测到特征坍缩！所有特征的标准差都接近于0。")
+                elif n_dead > aggregated.shape[1] * 0.5:
+                    print(f"[WARNING] 检测到部分特征坍缩！{n_dead}/{aggregated.shape[1]} 特征死亡。")
+                else:
+                    print("[INFO] 未发现明显的特征坍缩。")
+
+    print("=" * 60 + "\n")
+
+
+def main():
+    cfg = Config()
+
+    # 设置随机种子
+    set_global_seed(cfg, is_main=True)
+
+    # 设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] 使用设备: {device}")
+
+    # 创建数据加载器
+    train_loader, val_loader, test_loader = create_dataloaders(cfg, is_main=True)
+
+    # 创建模型
+    if cfg.use_dual_branch:
+        model = create_dual_branch_model(cfg, device)
+        setup_dual_branch_freezing(
+            model,
+            train_mode1=cfg.train_mode1,
+            train_mode2=cfg.train_mode2,
+            unfreeze_last_n_blocks1=cfg.unfreeze_last_n_blocks1,
+            unfreeze_last_n_blocks2=cfg.unfreeze_last_n_blocks2,
+            use_dora_branch2=cfg.use_dora_branch2,
+            dora_branch2_r=cfg.dora_branch2_r,
+            dora_branch2_alpha=cfg.dora_branch2_alpha,
+            dora_branch2_target_modules=cfg.dora_branch2_target_modules,
+            is_main=True,
+        )
     else:
-        print("logits std: N/A (empty batch)")
+        model = create_model(cfg, device)
+        setup_parameter_freezing(
+            model,
+            train_mode=cfg.train_mode,
+            is_main=True,
+            unfreeze_last_n_blocks=cfg.unfreeze_last_n_blocks,
+        )
 
-    print("=" * 60 + "\n")
+    # 诊断加载后的模型
+    diagnose_loaded_collapse(model, train_loader, device, is_main=True)
 
-
-@torch.no_grad()
-def quick_inference_test(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    is_main: bool = True,
-    max_samples: int = 10,
-) -> None:
-    """Run a small inference pass before training starts."""
-    if not is_main:
-        return
-
-    model.eval()
-    try:
-        batch_data = next(iter(loader))
-    except StopIteration:
-        print("[WARN] Quick inference skipped: loader is empty.")
-        return
-
-    data, target, sample_id, age, measures = batch_data
-
-    # If a two-view batch slips in, keep the first view only.
-    if data.ndim == 6 and data.size(1) == 2:
-        data = data[:, 0]
-
-    data = data.to(device, non_blocking=True)
-
-    logits = model(data, return_features=False)
-    preds = logits.argmax(dim=1).detach().cpu().tolist()
-    targets = target.detach().cpu().tolist()
-
-    print("\n" + "=" * 60)
-    print("[DIAG] Quick inference preview (single batch)")
-    print("=" * 60)
-    for i in range(min(max_samples, logits.shape[0])):
-        logit_str = ", ".join([f"{v:.4f}" for v in logits[i].detach().cpu().tolist()])
-        sid = sample_id[i] if isinstance(sample_id, list) else str(sample_id)
-        print(f"  {sid} | pred={preds[i]} true={targets[i]} | logits=[{logit_str}]")
-    print("=" * 60 + "\n")
-
-
-def train(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    cfg: Config,
-    device: torch.device,
-    is_main: bool = True,
-):
-    """训练循环"""
-    # 使用 Label Smoothing 减少过拟合，帮助模型在相似特征上更好地学习
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # 创建优化器
     optimizer = create_optimizer(model, cfg)
-    scheduler = create_lr_scheduler(optimizer, cfg.num_epochs, cfg.warmup_epochs)
 
-    # 【诊断】检查优化器配置
-    if is_main:
-        check_optimizer_config(optimizer, model)
-
-    # AMP
-    amp_enabled = device.type == "cuda"
-    GradScaler = getattr(torch.amp, "GradScaler", None)
-    scaler = (
-        GradScaler("cuda", enabled=amp_enabled)
-        if GradScaler is not None
-        else torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    # 创建学习率调度器
+    scheduler = create_lr_scheduler(
+        optimizer,
+        cfg.num_epochs,
+        cfg.warmup_epochs,
+        min_lr=cfg.min_lr,
+        wd_init=cfg.weight_decay_init,
+        wd_end=cfg.weight_decay_end,
     )
 
-    # Global Loss
+    # 损失函数
+    criterion = nn.CrossEntropyLoss()
+    if cfg.balance_strategy == "class_weight":
+        # 基于训练集（实际使用的索引）计算 class weights，避免丢数据但缓解类别不均衡
+        train_subset = train_loader.dataset  # Subset(full_dataset, train_idx_used)
+        base_ds = getattr(train_subset, "dataset", None)
+        indices = getattr(train_subset, "indices", None)
+        if base_ds is None or indices is None:
+            raise RuntimeError("class_weight 需要 train_loader.dataset 为 Subset，并包含 dataset/indices")
+
+        counts = np.zeros(int(cfg.num_classes), dtype=np.int64)
+        for idx in indices:
+            dx = base_ds.valid_samples[idx]["DX_group"]
+            cls_id = int(base_ds.LABEL_MAP[dx])
+            counts[cls_id] += 1
+
+        total = int(counts.sum())
+        weights = np.zeros(int(cfg.num_classes), dtype=np.float32)
+        for c in range(int(cfg.num_classes)):
+            if counts[c] > 0:
+                # 使平均权重约为 1，便于训练稳定：w_c = total / (C * count_c)
+                weights[c] = float(total) / float(int(cfg.num_classes) * int(counts[c]))
+
+        weight_tensor = torch.as_tensor(weights, dtype=torch.float32, device=device)
+        criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+        print(
+            f"[BALANCE] class_weight enabled: counts={counts.tolist()}, weights={weights.tolist()}"
+        )
     global_loss_fn = None
     if cfg.use_global_loss:
         global_loss_fn = AnatCLGlobalLoss(cfg)
-        print(f"[INFO] 启用 Global Loss，权重 lambda_global = {cfg.lambda_global}")
-    else:
-        print("[INFO] 未启用 Global Loss")
+        print(
+            f"[INFO] 启用 Global Loss: lambda_global={cfg.lambda_global}, "
+            f"warmup_epochs={getattr(cfg, 'lambda_global_warmup_epochs', 0)}"
+        )
+
+    print(f"[INFO] 模型选择指标: {cfg.model_selection_metric}")
 
     # 早停
     os.makedirs(cfg.model_save_dir, exist_ok=True)
+    save_path = os.path.join(cfg.model_save_dir, cfg.model_save_name or "model.pth")
     early_stopping = EarlyStopping(
         patience=cfg.patience,
-        save_path=os.path.join(cfg.model_save_dir, cfg.model_save_name),
-        is_main=is_main,
+        save_path=save_path,
+        is_main=True,
+        min_delta=1e-4,
     )
 
-    best_val_acc = 0
+    # 训练循环
     train_losses, val_losses = [], []
+    train_ce_losses, val_ce_losses = [], []
+    train_global_losses, val_global_losses = [], []
     train_accs, val_accs = [], []
 
-    for epoch in range(1, cfg.num_epochs + 1):
-        tr_loss, tr_acc = train_epoch(
+    for epoch in range(cfg.num_epochs):
+        print(f"\nEpoch {epoch + 1}/{cfg.num_epochs}")
+        print("-" * 40)
+
+        # 修复 warmup/scheduler off-by-one：在每个 epoch 开始 step，使 epoch0 即生效
+        if scheduler is not None:
+            scheduler.step(epoch)
+
+        # Global Loss 权重 warmup（用于 total loss，但选模/早停默认用 Val CE 对齐分类目标）
+        lambda_global_epoch = schedule_lambda_global(epoch, cfg)
+        if cfg.use_global_loss:
+            print(
+                f"[INFO] lambda_global(epoch={epoch})={lambda_global_epoch:.6f} "
+                f"(base={cfg.lambda_global}, warmup_epochs={getattr(cfg, 'lambda_global_warmup_epochs', 0)})"
+            )
+
+        # 训练
+        train_loss, train_ce_loss, train_global_loss, train_acc = train_epoch(
             model,
             train_loader,
             criterion,
             optimizer,
             device,
-            scaler,
+            scaler=None,  # 不使用混合精度
             max_grad_norm=cfg.max_grad_norm,
             global_loss_fn=global_loss_fn,
-            lambda_global=cfg.lambda_global,
+            lambda_global=lambda_global_epoch,
             gradient_accumulation_steps=cfg.gradient_accumulation_steps,
             enable_memory_efficient=cfg.enable_memory_efficient_mode,
         )
-        
-        # 修复 UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`
-        # 应该在 train_epoch (包含 optimizer.step) 之后调用 scheduler.step()
-        scheduler.step()
-        
-        va_loss, va_ce_loss, va_acc, val_preds, val_targets, _, _ = validate_epoch(
+
+        # 验证
+        val_loss, val_ce_loss, val_global_loss, val_acc, val_preds, val_targets, _, _ = validate_epoch(
             model,
             val_loader,
             criterion,
             device,
-            is_main,
+            is_main=True,
             enable_memory_efficient=cfg.enable_memory_efficient_mode,
             global_loss_fn=global_loss_fn,
-            lambda_global=cfg.lambda_global,
-            debug_first_batch=(epoch == 1),  # 第一个 epoch 启用调试
+            lambda_global=lambda_global_epoch,
         )
 
-        # 学习率调度：在 optimizer.step() 之后调用，不传 epoch 参数
-        train_losses.append(tr_loss)
-        train_accs.append(tr_acc)
-        val_losses.append(va_loss)
-        val_accs.append(va_acc)
+        # 记录
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_ce_losses.append(train_ce_loss)
+        val_ce_losses.append(val_ce_loss)
+        train_global_losses.append(train_global_loss)
+        val_global_losses.append(val_global_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
 
-        if va_acc > best_val_acc:
-            best_val_acc = va_acc
+        # 打印分开的loss
+        print(
+            f"Train - Total: {train_loss:.4f}, CE: {train_ce_loss:.4f}, Global: {train_global_loss:.4f}, Acc: {train_acc:.2f}%"
+        )
+        print(
+            f"Val   - Total: {val_loss:.4f}, CE: {val_ce_loss:.4f}, Global: {val_global_loss:.4f}, Acc: {val_acc:.2f}%"
+        )
 
-        if is_main:
-            plot_confusion_matrix(
-                val_targets, val_preds, cfg.classes, epoch, prefix="val"
-            )
-            print(
-                f"Epoch {epoch:03d} | "
-                f"Train loss: {tr_loss:.4f} | Train acc: {tr_acc:.2f}% | "
-                f"Val loss: {va_loss:.4f} (CE: {va_ce_loss:.4f}) | Val acc: {va_acc:.2f}%"
-            )
+        # 宏平均指标（macro recall/F1）+ 每类 recall（定位不均衡瓶颈）
+        val_metrics = compute_metrics(val_targets, val_preds, int(cfg.num_classes))
+        per_class_recall = val_metrics["per_class_recall"]
+        per_class_recall_str = ", ".join(
+            f"{cls}={per_class_recall[i] * 100:.2f}%"
+            for i, cls in enumerate(cfg.classes)
+        )
+        print(
+            f"Val   - MacroRecall: {val_metrics['macro_recall'] * 100:.2f}%, "
+            f"MacroF1: {val_metrics['macro_f1'] * 100:.2f}%, "
+            f"PerClassRecall: [{per_class_recall_str}]"
+        )
 
-        # 使用 CE Loss 进行早停监测（关注分类性能）
-        early_stopping(va_ce_loss, model)
+        # 打印混淆矩阵
+        plot_confusion_matrix(val_targets, val_preds, cfg.classes, epoch + 1, prefix="Val")
+
+        # 早停检查
+        if cfg.model_selection_metric == "val_ce":
+            monitor = float(val_ce_loss)
+            monitor_str = f"val_ce={val_ce_loss:.6f}"
+        elif cfg.model_selection_metric == "val_total":
+            monitor = float(val_loss)
+            monitor_str = f"val_total={val_loss:.6f}"
+        elif cfg.model_selection_metric == "val_acc":
+            # EarlyStopping 默认越小越好，使用 -acc 实现“越大越好”
+            monitor = -float(val_acc)
+            monitor_str = f"val_acc={val_acc:.2f}% (monitor={monitor:.6f})"
+        else:
+            raise ValueError(f"Unknown model_selection_metric: {cfg.model_selection_metric}")
+
+        print(f"[EARLYSTOP] monitor({cfg.model_selection_metric}): {monitor_str}")
+        early_stopping(monitor, model)
         if early_stopping.early_stop:
-            print("触发早停机制，停止训练")
+            print("早停触发，停止训练")
             break
 
-    if is_main:
-        print(f"[INFO] 训练结束，最佳验证准确率: {best_val_acc:.2f}%")
-        save_plots(train_losses, val_losses, train_accs, val_accs, cfg.png_save_dir, cfg)
+    # 加载最佳模型
+    print(f"\n[INFO] 加载最佳模型: {save_path}")
+    model.load_state_dict(torch.load(save_path, map_location=device))
 
-    return early_stopping.save_path
-
-
-def evaluate(
-    model: nn.Module,
-    test_loader: DataLoader,
-    cfg: Config,
-    device: torch.device,
-    is_main: bool = True,
-):
-    """评估测试集"""
-    criterion = nn.CrossEntropyLoss()
-
-    print("\n===== 测试集评估 =====")
-    test_loss, test_ce_loss, test_acc, test_preds, test_targets, test_ids, test_logits = (
-        validate_epoch(
-            model,
-            test_loader,
-            criterion,
-            device,
-            is_main,
-            enable_memory_efficient=cfg.enable_memory_efficient_mode,
-            # 测试时不使用 global_loss，只用 CE 损失
-        )
+    # 测试
+    print("\n" + "=" * 60)
+    print("测试集评估")
+    print("=" * 60)
+    test_loss, test_ce_loss, test_global_loss, test_acc, test_preds, test_targets, test_ids, test_logits = validate_epoch(
+        model,
+        test_loader,
+        criterion,
+        device,
+        is_main=True,
+        enable_memory_efficient=cfg.enable_memory_efficient_mode,
+        global_loss_fn=None,  # 测试阶段仅使用 CE
     )
 
-    print(f"测试集准确率: {test_acc:.2f}%，测试集损失: {test_loss:.4f} (CE: {test_ce_loss:.4f})")
-    plot_confusion_matrix(test_targets, test_preds, cfg.classes, "最终", prefix="test")
+    print(f"Test - Total: {test_loss:.4f}, CE: {test_ce_loss:.4f}, Acc: {test_acc:.2f}%")
+    test_metrics = compute_metrics(test_targets, test_preds, int(cfg.num_classes))
+    test_per_class_recall = test_metrics["per_class_recall"]
+    test_per_class_recall_str = ", ".join(
+        f"{cls}={test_per_class_recall[i] * 100:.2f}%"
+        for i, cls in enumerate(cfg.classes)
+    )
+    print(
+        f"Test - MacroRecall: {test_metrics['macro_recall'] * 100:.2f}%, "
+        f"MacroF1: {test_metrics['macro_f1'] * 100:.2f}%, "
+        f"PerClassRecall: [{test_per_class_recall_str}]"
+    )
+    plot_confusion_matrix(test_targets, test_preds, cfg.classes, epoch="Final", prefix="Test")
+
+    # 打印详细结果
     print_test_results(test_targets, test_preds, test_ids, test_logits, cfg.classes)
 
-
-def main():
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    is_main = True
-
-    # 配置（使用默认路径，或按需覆盖）
-    cfg = Config()
-
-    # 创建模型
-    model = create_model(cfg, device)
-    setup_parameter_freezing(
-        model, 
-        cfg.train_mode, 
-        is_main,
-        unfreeze_last_n_blocks=cfg.unfreeze_last_n_blocks,
-    )
-
-    # 参数统计
-    if is_main:
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
-        print(f"\n[INFO] 可训练参数: {trainable:,} / 总参数: {total:,}")
-        print(f"[INFO] 可训练比例: {100.0 * trainable / total:.2f}%")
-
-    # 创建数据加载器
-    train_loader, val_loader, test_loader = create_dataloaders(cfg, is_main)
-
-    # Diagnostic: check collapse right after loading weights (before training).
-    diagnose_loaded_collapse(model, val_loader, device, is_main=is_main)
-
-    # Quick inference test before training.
-    quick_inference_test(model, val_loader, device, is_main=is_main)
-
-    # 训练
-    best_model_path = train(model, train_loader, val_loader, cfg, device, is_main)
-
-    # 加载最佳模型并评估
-    if is_main:
-        model.load_state_dict(torch.load(best_model_path))
-        evaluate(model, test_loader, cfg, device, is_main)
+    # 保存训练曲线
+    os.makedirs(cfg.png_save_dir, exist_ok=True)
+    save_plots(train_losses, val_losses, train_accs, val_accs, cfg.png_save_dir, cfg)
+    print(f"\n[INFO] 训练曲线已保存至: {cfg.png_save_dir}")
 
 
 if __name__ == "__main__":

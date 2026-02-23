@@ -23,9 +23,9 @@ from monai.transforms.intensity.array import (
     ScaleIntensityRangePercentiles,
     RandScaleIntensity,
     RandShiftIntensity,
+    NormalizeIntensity,
 )
 from monai.transforms.spatial.array import (
-    Resize,
     Orientation,
     Spacing,
 )
@@ -33,24 +33,22 @@ from monai.transforms.croppad.array import (
     CropForeground,
     SpatialPad,
     RandSpatialCrop,
+    ResizeWithPadOrCrop,
 )
 from monai.transforms import (
     Compose,
     RandFlip,
-    RandGaussianNoise,
     Crop,
     Randomizable,
     RandRotate90,
     OneOf,
-    RandAdjustContrast,
     RandGaussianSharpen,
     RandGaussianSmooth,
-    RandHistogramShift,
     RandGibbsNoise,
 )
+from monai.data.meta_tensor import MetaTensor
 from monai.data.utils import get_random_patch, get_valid_patch_size
 import math
-
 import json
 
 
@@ -215,8 +213,8 @@ class RandomResizedCrop3d(Crop, Randomizable):
         size,
         in_slice_scale,
         cross_slice_scale,
-        interpolation='trilinear',
-        aspect_ratio=(0.9, 1/0.9),
+        interpolation="trilinear",
+        aspect_ratio=(0.9, 1 / 0.9),
     ):
         """
         Adapting torch RandomResizedCrop to 3D data by separating in-slice/in-plane and cross-slice dimensions.
@@ -283,7 +281,9 @@ class RandomResizedCrop3d(Crop, Randomizable):
     def __call__(self, img, lazy=False):
         self.randomize(img.shape[1:])
         cropped = super().__call__(img=img, slices=self._slices)
-        resized = F.interpolate(cropped.unsqueeze(0), size=self.size, mode=self.interpolation).squeeze(0)
+        resized = F.interpolate(
+            cropped.unsqueeze(0), size=self.size, mode=self.interpolation
+        ).squeeze(0)
         return resized
 
 
@@ -327,10 +327,9 @@ class MRIDataset(Dataset):
 
     LABEL_MAP = {"CN": 0, "sMCI": 1, "pMCI": 2, "Dementia": 3}
     VBM_NAME = "brain.nii.gz"
-    
+
     # 【诊断】用于记录 __getitem__ 调用情况
     _debug_getitem_calls = 0
-    _debug_last_indices = []
 
     def __init__(
         self,
@@ -342,7 +341,9 @@ class MRIDataset(Dataset):
         measure_root: Optional[str] = None,
         region_order_json: Optional[str] = None,
         enable_memory_efficient: bool = False,
-        two_view: bool = True,
+        min_int: float = -1.0,
+        resize_scale: float = 1.0,
+        use_nnunet_zscore: bool = False,
     ):
         """初始化 MRI 数据集。
 
@@ -368,8 +369,12 @@ class MRIDataset(Dataset):
                 若 measure_root 已设置，则此参数必须提供。
             enable_memory_efficient: [已弃用] 此参数保留用于向后兼容，但已不再使用。
                 MONAI 的 LoadImage 会自动处理内存优化。
+            min_int: 背景裁剪阈值，默认 -1.0。
+            resize_scale: 重采样缩放比例，默认 1.0。
         """
         self.data_dir = data_dir
+        self.csv_file_processed = csv_file_processed
+        self.region_order_json = region_order_json
         self.target_size = target_size
         self.is_train = is_train
         self.age_csv = age_csv
@@ -377,13 +382,16 @@ class MRIDataset(Dataset):
         self.region_order: Optional[List[Tuple[str, str]]] = None
         self.train_idx_set: set = set()
         self.enable_memory_efficient = enable_memory_efficient
+        self.min_int = min_int
+        self.resize_scale = resize_scale
+        self.use_nnunet_zscore = use_nnunet_zscore
+        self._folder_map: Dict[str, str] = {}
+        # LRU-style cache with size limit to prevent unbounded memory growth
+        self._measures_cache_max_size = 10000
         self._measures_cache: Dict[str, torch.Tensor] = {}
         self._measure_meta_cache: Dict[
             str, Tuple[List[Tuple[str, str]], float, bool]
         ] = {}
-
-        # 构建 measure 索引
-        self._measure_index = self._build_measure_index()
 
         # 构建年龄映射
         self.age_map = build_age_map(Path(age_csv)) if age_csv else {}
@@ -396,41 +404,85 @@ class MRIDataset(Dataset):
         if self.measure_root is not None and self.region_order is None:
             raise ValueError("measure_root 已设置但 region_order_json 缺失")
 
+        # 控制初始化阶段 DROP 日志量（避免打印过多拖慢）
+        self.drop_log_limit = 50
+        self._drop_log_count = 0
+
+        self._measure_index = self._build_measure_index()
+        self._folder_map = self._build_folder_map()
+        self.valid_samples = self._load_samples(
+            self.csv_file_processed, self._folder_map
+        )
+
         # ---------------------------------------------------------
-        # 预训练流程对齐配置 (与 ADNI12/ADNI44 保持一致)
+        # 预训练流程对齐配置
         # ---------------------------------------------------------
-        min_int = 0.0
-        resize_scale = 1.0  # 默认 1.0mm isotropic
-        
         # 使用 MONAI 定义数据加载和预处理 (Array 模式)
-        self.loader = LoadImage(image_only=True, ensure_channel_first=True, dtype=np.float32)
-        
+        self.loader = LoadImage(
+            image_only=False, ensure_channel_first=True, dtype=np.float32
+        )
+
+        def _to_meta(x):
+            # LoadImage(image_only=False) -> (img, meta_dict)
+            if isinstance(x, (tuple, list)) and len(x) == 2:
+                img, meta = x
+                img = torch.as_tensor(img, dtype=torch.float32)
+                return MetaTensor(img, meta=meta)
+
+            # 如果仍然是“单输出”（说明上面的 image_only=False 没生效或被别处覆盖），做降级兜底
+            if isinstance(x, MetaTensor):
+                return x
+            if torch.is_tensor(x):
+                return MetaTensor(x.to(torch.float32), meta={})
+            if isinstance(x, np.ndarray):
+                return MetaTensor(torch.as_tensor(x, dtype=torch.float32), meta={})
+
+            return x  # 兜底，不再强行解包
+
         # 基础预处理流水线 (应用于 Train/Val/Test)
         # 1. 加载 -> 标准化 -> 方向 -> 重采样
         base_pre_ops = [
             self.loader,  # 首先加载图像
-            Orientation(axcodes="RAS"),
+            _to_meta,
+            Orientation(axcodes="RAS", labels=None),
             Spacing(
-                pixdim=(1.0 / resize_scale, 1.0 / resize_scale, 1.0 / resize_scale),
+                pixdim=(
+                    1.0 / self.resize_scale,
+                    1.0 / self.resize_scale,
+                    1.0 / self.resize_scale,
+                ),
                 mode="bilinear",
             ),
             # 2. 强度归一化 (使用 0.05% 到 99.95% 百分位)
             ScaleIntensityRangePercentiles(
-                lower=0.05, upper=99.95, b_min=min_int, b_max=1.0, clip=True
+                lower=0.05,
+                upper=99.95,
+                b_min=self.min_int,
+                b_max=1.0,
+                clip=True,
+                channel_wise=True,
             ),
             # 3. 前景裁剪
-            CropForeground(select_fn=lambda x: x > min_int),
+            CropForeground(select_fn=lambda x: x > self.min_int),
             # 4. 填充到目标尺寸 (如果小于目标尺寸)
-            SpatialPad(spatial_size=target_size, value=min_int),
-            # 5. 确保最终输出尺寸一致 (如果是分类任务，通常需要固定输入尺寸)
-            Resize(spatial_size=target_size, mode="trilinear"),
+            SpatialPad(spatial_size=target_size, value=self.min_int),
+            # 5. 移除 Resize，改为后续的 Crop 操作以保持分辨率一致
+            # Resize(spatial_size=target_size, mode="trilinear"),
         ]
-        self.base_pre = Compose(base_pre_ops)
+        self.base_pre = Compose(base_pre_ops, map_items=False)
 
-        # 训练数据基础增强 (几何 + 强度) - 基于预训练项目 snippet
+        # 使用 ResizeWithPadOrCrop 确保输出尺寸严格等于 target_size
+        self.val_transform = ResizeWithPadOrCrop(
+            spatial_size=target_size, mode="minimum"
+        )
+
+        # 训练数据基础增强 (几何 + 强度) - 对应预训练项目的 RandCropByPosNegLabeld 等
         base_augment_ops = [
-            # 1. 随机裁剪 (对标 RandCropByPosNegLabeld)
-            RandSpatialCrop(roi_size=target_size, random_center=True, random_size=False),
+            # 1. 随机裁剪 (对标 RandCropByPosNegLabeld，由于分类任务无 label 影像，使用 RandSpatialCrop)
+            # SpatialPad 保证了图像至少有 target_size 大小，RandSpatialCrop 将其裁剪为固定尺寸
+            RandSpatialCrop(
+                roi_size=target_size, random_center=True, random_size=False
+            ),
             # 2. 几何增强 (对标 RandFlipd, RandRotate90d)
             RandFlip(prob=0.5, spatial_axis=0),
             RandFlip(prob=0.5, spatial_axis=1),
@@ -442,53 +494,19 @@ class MRIDataset(Dataset):
         ]
         base_augment = Compose(base_augment_ops)
 
-        # ---------------------------------------------------------
-        # 双视图差异化增强配置 (与 Teacher 网络预训练一致)
-        # ---------------------------------------------------------
-        # View 1 Extra: 强高斯平滑或锐化
-        view1_extra = OneOf(
-            [
-                RandGaussianSmooth(prob=1.0),
-                RandGaussianSharpen(prob=1.0),
-            ]
-        )
+        self.train_transform = base_augment if is_train else None
 
-        # View 2 Extra: 弱高斯平滑/锐化 + Gibbs 噪声
-        view2_extra = Compose(
-            [
-                OneOf(
-                    [
-                        RandGaussianSmooth(prob=0.1),
-                        RandGaussianSharpen(prob=0.1),
-                    ]
-                ),
-                RandGibbsNoise(prob=0.2),
-            ]
-        )
-
-        # 最终训练转换
-        self.train_transform1 = (
-            Compose([base_augment, view1_extra])
-            if is_train
-            else None
-        )
-        self.train_transform2 = (
-            Compose([base_augment, view2_extra])
-            if is_train
-            else None
-        )
-
-        # 保留单视图兼容
-        self.train_transform = self.train_transform1
-
-        self.two_view = bool(two_view)
-
-        # 控制初始化阶段 DROP 日志量（避免打印过多拖慢）
-        self.drop_log_limit = 50
-        self._drop_log_count = 0
+        # nnUNet ZScore 归一化 (在已有预处理后、增强前应用)
+        if self.use_nnunet_zscore:
+            self.zscore_normalize = NormalizeIntensity(
+                subtrahend=None, divisor=None, nonzero=False, channel_wise=True
+            )
+            print("[INFO] 启用 nnUNet ZScore 归一化 (归一化后再增强)")
+        else:
+            self.zscore_normalize = None
 
         # 加载样本
-        self.valid_samples = self._load_samples(csv_file_processed)
+        # self.valid_samples = self._load_samples(csv_file_processed)
 
     def _build_measure_index(self) -> Dict[str, str]:
         """构建 measure csv 索引"""
@@ -518,10 +536,9 @@ class MRIDataset(Dataset):
 
         return index
 
-    def _load_samples(self, csv_file: str) -> List[Dict]:
+    def _load_samples(self, csv_file: str, folder_map: Dict[str, str]) -> List[Dict]:
         """加载并验证样本"""
         df = self._read_and_clean_csv(csv_file)
-        folder_map = self._build_folder_map()
 
         valid_samples = []
         dropped_samples = []
@@ -833,47 +850,51 @@ class MRIDataset(Dataset):
         return len(self.valid_samples)
 
     def __getitem__(self, idx):
-        # 【诊断】记录调用情况，用于检测重复样本
         MRIDataset._debug_getitem_calls += 1
-        MRIDataset._debug_last_indices.append(idx)
-        if len(MRIDataset._debug_last_indices) > 100:
-            MRIDataset._debug_last_indices = MRIDataset._debug_last_indices[-100:]
-        
+
         row = self.valid_samples[idx]
+
+        # Define path early to ensure it's available for error messages
         path = os.path.join(self.data_dir, row["FolderName"], "mri", self.VBM_NAME)
 
         # 应用基础预处理流水线 (包含加载、重采样、归一化、裁剪、填充、调整尺寸)
         try:
             img = self.base_pre(path)  # 返回 numpy array, shape: (C, D, H, W)
         except Exception as e:
-            sample_id = f"{row.get('PTID', '?')}_{normalize_image_id(str(row.get('ImageID', '?')))}"
+            sample_id = (
+                f"{row.get('PTID', '?')}_{normalize_image_id(str(row.get('ImageID', '?')))}"
+            )
             raise RuntimeError(
                 f"Failed to load/preprocess NIfTI: sample={sample_id}, path={path}"
             ) from e
 
-        # 检查数值有效性
-        if not np.isfinite(img).all():
+        # 检查数值有效性（兼容 ndarray / Tensor / MetaTensor）
+        if torch.is_tensor(img):
+            ok = torch.isfinite(img).all().item()
+        else:
+            ok = np.isfinite(img).all()
+
+        if not ok:
             sample_id = f"{row.get('PTID', '?')}_{normalize_image_id(str(row.get('ImageID', '?')))}"
             raise ValueError(
                 f"Non-finite values in image: sample={sample_id}, path={path}"
             )
 
-        # 转换为 Tensor
-        img = torch.as_tensor(img, dtype=torch.float32)
+        # 转换为 Tensor（避免重复拷贝）
+        if not torch.is_tensor(img):
+            img = torch.as_tensor(img, dtype=torch.float32)
+        else:
+            img = img.to(torch.float32)
 
-        two_view_sample = (
-            self.two_view
-            and (idx in self.train_idx_set)
-            and (self.train_transform1 is not None)
-        )
-        
-        if two_view_sample:
-            # 使用不同的增强（如果定义了的话），这里对齐预训练项目的两个增强视图
-            v1 = self.train_transform1(img)
-            v2 = self.train_transform2(img)
-            img = torch.stack([v1, v2], dim=0)  # [2, C, D, H, W]
-        elif (idx in self.train_idx_set) and (self.train_transform is not None):
+        # nnUNet ZScore 归一化：归一化后再增强
+        # 在数据增强之前应用，确保输入分布与预训练一致
+        if self.zscore_normalize is not None:
+            img = self.zscore_normalize(img)
+
+        if (idx in self.train_idx_set) and (self.train_transform is not None):
             img = self.train_transform(img)  # [C, D, H, W]
+        else:
+            img = self.val_transform(img)
 
         # 标签
         label = self.LABEL_MAP[row["DX_group"]]
@@ -884,8 +905,6 @@ class MRIDataset(Dataset):
 
         # 测量数据
         measures = self._get_measures(row)
-        if two_view_sample:
-            measures = torch.stack([measures, measures], dim=0)  # [2, K, 3]
 
         return img, torch.tensor(label, dtype=torch.long), sample_id, age, measures
 
@@ -899,6 +918,15 @@ class MRIDataset(Dataset):
         cached = self._measures_cache.get(measure_path)
         if cached is not None:
             return cached
+
+        # Enforce cache size limit (simple LRU-like eviction)
+        if len(self._measures_cache) >= self._measures_cache_max_size:
+            # Remove oldest entries (first 10% of cache)
+            keys_to_remove = list(self._measures_cache.keys())[
+                : self._measures_cache_max_size // 10
+            ]
+            for k in keys_to_remove:
+                del self._measures_cache[k]
 
         measures = vectorize_measures(Path(measure_path), self.region_order)
         measures = torch.from_numpy(measures).to(dtype=torch.float32)
