@@ -21,24 +21,27 @@ logger = logging.getLogger("dinov2")
 def load_pretrained_weights(model, pretrained_weights, checkpoint_key, strict=True):
     """
     加载预训练权重到模型。
-    
+
     Args:
         model: 目标模型
         pretrained_weights: 预训练权重路径或 URL
         checkpoint_key: checkpoint 中的 key（如 "teacher"）
         strict: 是否严格匹配。如果为 True，任何不匹配都会抛出错误
     """
-    if urlparse(pretrained_weights).scheme:  # If it looks like an URL
+    if (
+        urlparse(pretrained_weights).scheme
+        and len(urlparse(pretrained_weights).scheme) > 1
+    ):  # If it looks like an URL (and not a drive letter)
         state_dict = torch.hub.load_state_dict_from_url(
             pretrained_weights, map_location="cpu"
         )
     else:
         state_dict = torch.load(pretrained_weights, map_location="cpu")
-    
+
     if checkpoint_key is not None and checkpoint_key in state_dict:
         print(f"[INFO] 使用 checkpoint key: '{checkpoint_key}'")
         state_dict = state_dict[checkpoint_key]
-    
+
     # remove `module.` prefix
     state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     # remove `backbone.` prefix induced by multicrop wrapper
@@ -51,92 +54,121 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, strict=Tr
         for k, v in state_dict.items():
             for prefix in vit_prefixes:
                 if k.startswith(prefix):
-                    filtered[k[len(prefix):]] = v
+                    filtered[k[len(prefix) :]] = v
                     break
         state_dict = filtered
 
     model_state = model.state_dict()
-    
+
     # 检查形状不匹配的参数
     shape_mismatch = []
     for k, v in state_dict.items():
         if k in model_state and model_state[k].shape != v.shape:
-            shape_mismatch.append({
-                "name": k,
-                "ckpt_shape": tuple(v.shape),
-                "model_shape": tuple(model_state[k].shape),
-            })
-    
+            shape_mismatch.append(
+                {
+                    "name": k,
+                    "ckpt_shape": tuple(v.shape),
+                    "model_shape": tuple(model_state[k].shape),
+                }
+            )
+
     # 检查缺失的参数（在 checkpoint 中有，但模型中没有）
     unexpected_keys = [k for k in state_dict.keys() if k not in model_state]
-    
+
     # 检查模型中有但 checkpoint 中没有的参数
     missing_keys = [k for k in model_state.keys() if k not in state_dict]
-    
+
     # 打印诊断信息
-    print(f"\n{'='*60}")
-    print(f"[预训练权重加载诊断]")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("[预训练权重加载诊断]")
+    print(f"{'=' * 60}")
     print(f"预训练权重路径: {pretrained_weights}")
     print(f"Checkpoint 参数数量: {len(state_dict)}")
     print(f"模型参数数量: {len(model_state)}")
-    print(f"形状匹配的参数: {len(state_dict) - len(shape_mismatch) - len(unexpected_keys)}")
+    print(
+        f"形状匹配的参数: {len(state_dict) - len(shape_mismatch) - len(unexpected_keys)}"
+    )
     print(f"形状不匹配的参数: {len(shape_mismatch)}")
     print(f"Checkpoint 中多余的参数: {len(unexpected_keys)}")
     print(f"模型中缺失的参数: {len(missing_keys)}")
-    
+
     if shape_mismatch:
-        print(f"\n[形状不匹配的参数详情]:")
+        print("\n[形状不匹配的参数详情]:")
         for item in shape_mismatch[:10]:  # 只显示前 10 个
-            print(f"  - {item['name']}: checkpoint={item['ckpt_shape']} vs model={item['model_shape']}")
+            print(
+                f"  - {item['name']}: checkpoint={item['ckpt_shape']} vs model={item['model_shape']}"
+            )
         if len(shape_mismatch) > 10:
             print(f"  ... 以及其他 {len(shape_mismatch) - 10} 个参数")
-    
+
     if unexpected_keys:
-        print(f"\n[Checkpoint 中多余的参数（前10个）]:")
+        print("\n[Checkpoint 中多余的参数（前10个）]:")
         for k in unexpected_keys[:10]:
             print(f"  - {k}")
         if len(unexpected_keys) > 10:
             print(f"  ... 以及其他 {len(unexpected_keys) - 10} 个参数")
-    
+
     if missing_keys:
-        print(f"\n[模型中缺失的参数（前10个）]:")
+        print("\n[模型中缺失的参数（前10个）]:")
         for k in missing_keys[:10]:
             print(f"  - {k}")
         if len(missing_keys) > 10:
             print(f"  ... 以及其他 {len(missing_keys) - 10} 个参数")
-    
-    print(f"{'='*60}\n")
-    
+
+    print(f"{'=' * 60}\n")
+
     # 严格模式：如果有任何不匹配，抛出错误
     if strict:
         error_msgs = []
-        
+
         if shape_mismatch:
             error_msgs.append(f"发现 {len(shape_mismatch)} 个形状不匹配的参数！")
-        
+
         if unexpected_keys:
-            error_msgs.append(f"发现 {len(unexpected_keys)} 个多余的参数（checkpoint 中有但模型中没有）！")
-            
+            error_msgs.append(
+                f"发现 {len(unexpected_keys)} 个多余的参数（checkpoint 中有但模型中没有）！"
+            )
+
         if missing_keys:
-            error_msgs.append(f"发现 {len(missing_keys)} 个缺失的参数（模型中有但 checkpoint 中没有）！")
-            
+            error_msgs.append(
+                f"发现 {len(missing_keys)} 个缺失的参数（模型中有但 checkpoint 中没有）！"
+            )
+
         if error_msgs:
             raise RuntimeError(
-                "预训练权重加载失败（严格模式）：\n" + 
-                "\n".join(error_msgs) + 
-                "\n请检查模型架构与权重文件是否完全一致。"
+                "预训练权重加载失败（严格模式）：\n"
+                + "\n".join(error_msgs)
+                + "\n请检查模型架构与权重文件是否完全一致。"
             )
-    
+
     # 只加载形状匹配的参数
-    matched_state = {k: v for k, v in state_dict.items() 
-                     if k in model_state and model_state[k].shape == v.shape}
-    
+    matched_state = {
+        k: v
+        for k, v in state_dict.items()
+        if k in model_state and model_state[k].shape == v.shape
+    }
+
     # 如果 strict=True，使用 PyTorch 原生严格加载；否则允许不匹配
     msg = model.load_state_dict(matched_state, strict=strict)
-    
+
     print(f"[INFO] 成功加载 {len(matched_state)} 个预训练参数")
-    
+
+    if len(matched_state) == 0:
+        raise RuntimeError(
+            "严重错误: 未加载任何预训练权重！\n"
+            "可能原因:\n"
+            "1. Checkpoint key 错误 (例如 'teacher' vs 'model' vs 'state_dict')\n"
+            "2. 参数名称前缀不匹配 (例如 'backbone.' 或 'module.' 未被正确移除)\n"
+            "请检查 [预训练权重加载诊断] 部分的详细日志。"
+        )
+
+    # 简单启发式检查：如果加载比例过低 (<10%) 也报错
+    if len(matched_state) < len(model_state) * 0.1:
+        raise RuntimeError(
+            f"严重告警: 仅加载了 {len(matched_state)}/{len(model_state)} ({len(matched_state) / len(model_state):.1%}) 个参数！\n"
+            "这通常意味着权重文件与模型结构不匹配，请检查 logs。"
+        )
+
     return msg
 
 
