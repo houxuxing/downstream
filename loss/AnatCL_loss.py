@@ -21,10 +21,11 @@ AnatCL losses (Local / Global) extended from y-Aware (Duplums).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from config import Config
 
